@@ -112,7 +112,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
    - **Option 1: CPU & macOS (minimal, torch-free)** — RTF ≈ 0.5, no GPU needed
 
      ```bash
-     uv sync
+     uv sync --locked
      ```
    - **Option 2: GPU** — **v3 Turbo on GPU (PyTorch)** — RTF ≈ 0.02 batched, 16 real-time streams
 

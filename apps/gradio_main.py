@@ -1850,7 +1850,12 @@ EXAMPLES_LIST = [
     ["Hà Nội những ngày vào thu mang một vẻ đẹp trầm mặc và cổ kính đến lạ thường.", "Bình (nam miền Bắc)"],
 ]
 
-with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo:
+# The standalone Intel XPU installer also uses this app as its Gradio 5 fallback.
+gradio_6 = int(gr.__version__.split(".", 1)[0]) >= 6
+appearance = {"theme": theme, "css": css, "head": head_html}
+copy_button = {"buttons": ["copy"]} if gradio_6 else {"show_copy_button": True}
+
+with gr.Blocks(title="VieNeu-TTS", **({} if gradio_6 else appearance)) as demo:
     # Session ID for cancellation tracking
     session_id_state = gr.State("")
 
@@ -2268,7 +2273,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         elem_classes="status-box",
                         lines=2,
                         max_lines=10,
-                        show_copy_button=True
+                        **copy_button
                     )
                 with gr.Group():
                     estimate_output = gr.Textbox(
@@ -2276,7 +2281,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         elem_classes="estimate-box",
                         lines=2,
                         max_lines=4,
-                        show_copy_button=True
+                        **copy_button
                     )
                 download_btn = gr.DownloadButton(
                     "📥 Tải xuống file Audio",
@@ -2678,7 +2683,13 @@ def main():
         print(f"⚠️  The Web UI is reachable beyond this machine ({where}) with no login. "
               "Set VIENEU_WEB_AUTH=user:password to require one.")
 
-    demo.queue().launch(server_name=server_name, server_port=server_port, share=share, auth=auth)
+    demo.queue().launch(
+        server_name=server_name,
+        server_port=server_port,
+        share=share,
+        auth=auth,
+        **(appearance if gradio_6 else {}),
+    )
 
 if __name__ == "__main__":
     main()
