@@ -345,3 +345,83 @@ def test_onnx_stream_env_vars_clamped_and_only_forwarded_on_onnx(monkeypatch):
     pt_call = e_pt.tts.stream_calls[-1]
     assert "chunk_frames" not in pt_call
     assert "stream_babble_retries" not in pt_call
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+def test_direct_task_cancel_signals_immediately_and_holds_slot_until_worker_exits(eng, spec_version):
+    import threading
+
+    in_worker = threading.Event()
+    release_worker = threading.Event()
+    captured = {"cancel_event": None, "closes": 0}
+    orig_release = eng.release
+    releases = 0
+
+    def counting_release():
+        nonlocal releases
+        releases += 1
+        orig_release()
+
+    eng.release = counting_release
+
+    def gated_stream(text, **kw):
+        captured["cancel_event"] = kw.get("cancel_event")
+        assert captured["cancel_event"] is not None
+        try:
+            in_worker.set()
+            # Simulate an uninterruptible in-flight native ONNX call held by a gate.
+            release_worker.wait(timeout=5.0)
+            if captured["cancel_event"].is_set():
+                return
+            yield np.zeros(4800, dtype=np.float32)
+        finally:
+            captured["closes"] += 1
+
+    eng.tts.infer_stream = gated_stream
+    resp = api.speech(api.SpeechRequest(input="Xin chào.", response_format="pcm"))
+    assert eng.active == 1
+
+    async def run():
+        never = asyncio.Event()
+
+        async def receive():
+            await never.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_msg):
+            pass
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": spec_version}, "method": "POST"}
+        task = asyncio.create_task(resp(scope, receive, send))
+
+        # Wait until the worker thread is actively inside the gated generator step.
+        for _ in range(200):
+            if in_worker.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert in_worker.is_set(), f"ASGI {spec_version}: worker did not enter gated step"
+
+        # Cancel the response task directly while the native step is still held.
+        task.cancel()
+        await asyncio.sleep(0.08)
+
+        # While the worker step is still held:
+        # 1) cancel_event MUST already be set so native inference stops at the next check.
+        # 2) slot MUST remain occupied (no early release, no ValueError on executing generator).
+        assert captured["cancel_event"].is_set(), f"ASGI {spec_version}: cancel_event not set on direct Task.cancel()"
+        assert eng.active == 1, f"ASGI {spec_version}: slot released early while worker step still held"
+        assert not eng._gate.acquire(blocking=False), f"ASGI {spec_version}: gate freed while worker active"
+        assert not task.done(), f"ASGI {spec_version}: response task finished while worker still active"
+        assert captured["closes"] == 0, f"ASGI {spec_version}: generator closed while step still executing"
+
+        # Release the worker step and verify clean single close + single slot release.
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=3.0)
+
+    asyncio.run(run())
+    assert captured["closes"] == 1
+    assert releases == 1
+    assert eng.active == 0
+    assert eng._gate.acquire(blocking=False)
+    eng._gate.release()

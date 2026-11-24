@@ -613,28 +613,29 @@ class OnnxV3LiteEngine:
         if wav is None:
             return None
 
-        sr = int(getattr(self, "sample_rate", self.SAMPLE_RATE))
-        best = babble_suspect(wav, sr, phonemes, max_new_frames, len(frames))
-        tries = 0
-        while best[0] and tries < retries:
-            if _cancelled():
-                return None
-            f2 = _gen_once()
-            if f2 is None:
-                return None
-            tries += 1
-            if not f2:
-                continue
-            w2 = _decode_cancellable(f2)
-            if w2 is None:
-                return None
-            cand = babble_suspect(w2, sr, phonemes, max_new_frames, len(f2))
-            if babble_prefer(cand, best):
-                frames, wav, best = f2, w2, cand
-        if tries and not _cancelled():
-            logging.getLogger("Vieneu.V3Turbo.ONNX").info(
-                "🔁 " + babble_log_line(best, tries, max_new_frames)
-            )
+        if retries > 0:
+            sr = int(getattr(self, "sample_rate", self.SAMPLE_RATE))
+            best = babble_suspect(wav, sr, phonemes, max_new_frames, len(frames))
+            tries = 0
+            while best[0] and tries < retries:
+                if _cancelled():
+                    return None
+                f2 = _gen_once()
+                if f2 is None:
+                    return None
+                tries += 1
+                if not f2:
+                    continue
+                w2 = _decode_cancellable(f2)
+                if w2 is None:
+                    return None
+                cand = babble_suspect(w2, sr, phonemes, max_new_frames, len(f2))
+                if babble_prefer(cand, best):
+                    frames, wav, best = f2, w2, cand
+            if tries and not _cancelled():
+                logging.getLogger("Vieneu.V3Turbo.ONNX").info(
+                    "🔁 " + babble_log_line(best, tries, max_new_frames)
+                )
         if _cancelled():
             return None
         return wav
@@ -653,21 +654,13 @@ class OnnxV3LiteEngine:
 
         Uses the MOSS streaming codec (decode_step), which is bit-exact to the full
         decoder, so streamed audio matches non-streaming quality with no boundary
-        clicks. Falls back to a single ``infer`` if the streaming codec is missing.
+        clicks. Falls back to cancellation-aware whole-chunk generation if the
+        streaming codec is missing.
         """
         def _cancelled() -> bool:
             return cancel_event is not None and cancel_event.is_set()
 
         if _cancelled():
-            return
-        if self.sess_codec_step is None or self._codec_stream_spec is None:
-            wav = self.infer(phonemes=phonemes, text=text, ref_codes=ref_codes,
-                             speaker_emb=speaker_emb, use_ref_codes=use_ref_codes,
-                             temperature=temperature, top_k=top_k, top_p=top_p,
-                             max_new_frames=max_new_frames, repetition_penalty=repetition_penalty,
-                             repetition_window=repetition_window)
-            if not _cancelled():
-                yield wav
             return
         if phonemes is None:
             from vieneu_utils.phonemize_text import phonemize_text_with_emotions
@@ -683,6 +676,25 @@ class OnnxV3LiteEngine:
         anchor = self._speaker_anchor(speaker_emb)
         rows = self._build_rows(phonemes, ref_codes, style_id)
         prompt_embeds = self._embed_rows(rows, anchor)
+
+        if self.sess_codec_step is None or self._codec_stream_spec is None:
+            fallback_retries = int(getattr(self, "babble_retries", BABBLE_MAX_RETRIES)) if frame_cap else 0
+            wav = self._generate_cancellable(
+                phonemes=phonemes,
+                prompt_embeds=prompt_embeds,
+                anchor=anchor,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                max_new_frames=max_new_frames,
+                repetition_penalty=repetition_penalty,
+                repetition_window=repetition_window,
+                retries=max(0, fallback_retries),
+                cancel_event=cancel_event,
+            )
+            if wav is not None and not _cancelled():
+                yield wav
+            return
 
         babble_retries = max(0, min(2, int(stream_babble_retries or 0)))
         if babble_retries > 0 and frame_cap and self._is_short_cue_for_babble(phonemes):

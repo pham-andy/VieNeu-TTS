@@ -303,6 +303,36 @@ def test_cancel_after_first_pcm_and_chunk_frames_cap():
     assert sum(eng_cap._decoded_chunk_sizes) == 40
 
 
+def test_codec_fallback_cancels_during_first_acoustic_call_and_normal_fallback_outputs_48khz():
+    # 1. Streaming codec unavailable + cancel during first acoustic call -> zero further native calls or PCM.
+    ev = threading.Event()
+
+    def on_ac(call_n, _attempt, _frame_n, _is_first_sub):
+        if call_n == 1:
+            ev.set()
+
+    eng_cancel = _make_fake_engine(eos_on_frame=6, on_ac=on_ac)
+    eng_cancel.sess_codec_step = None
+    eng_cancel._codec_stream_spec = None
+    out_cancel = list(eng_cancel.infer_stream(phonemes="a b c d e", cancel_event=ev))
+    assert out_cancel == []
+    assert eng_cancel.sess_pre.calls == 1
+    assert eng_cancel.sess_ac.calls == 1
+    assert eng_cancel.sess_dec.calls == 0
+    assert eng_cancel.sess_codec_dec.calls == 0
+
+    # 2. Normal fallback without cancellation still yields full 48 kHz float32 waveform.
+    eng_ok = _make_fake_engine(eos_on_frame=6)
+    eng_ok.sess_codec_step = None
+    eng_ok._codec_stream_spec = None
+    out_ok = list(eng_ok.infer_stream(phonemes="a b c d e f g", frame_cap=False))
+    assert len(out_ok) == 1
+    assert out_ok[0].dtype == np.float32
+    assert len(out_ok[0]) == 6 * CODEC_SAMPLES_PER_FRAME
+    assert eng_ok.sess_codec_dec.calls == 1
+    assert eng_ok.SAMPLE_RATE == 48_000
+
+
 def test_v3turbo_forwards_onnx_stream_args_only_on_onnx_backend(monkeypatch):
     import vieneu.v3turbo as v3mod
 

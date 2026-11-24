@@ -54,6 +54,7 @@ Environment:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hmac
 import io
@@ -200,24 +201,62 @@ def _asgi_spec_version(scope: dict) -> tuple[int, ...]:
         return (2, 0)
 
 
+class _GuardedBody:
+    """Serializes ``next()`` and ``close()`` on a sync generator so ``close()``
+    and slot release wait for any in-flight worker step to exit first."""
+
+    def __init__(self, body: Iterator[bytes], cancel_event: threading.Event):
+        self._body = body
+        self._cancel_event = cancel_event
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def __iter__(self) -> "_GuardedBody":
+        return self
+
+    def __next__(self) -> bytes:
+        with self._lock:
+            if self._closed or self._cancel_event.is_set():
+                raise StopIteration
+            return next(self._body)
+
+    def close(self) -> None:
+        self._cancel_event.set()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            close_fn = getattr(self._body, "close", None)
+            if close_fn is not None:
+                close_fn()
+
+
 class _SpeechResponse(StreamingResponse):
-    """A ``StreamingResponse`` that signals disconnect cancellation immediately
-    on both ASGI < 2.4 and ASGI >= 2.4 scopes, and closes its body the moment
-    the response ends instead of leaving that to the garbage collector.
+    """A ``StreamingResponse`` that signals disconnect and direct task
+    cancellation immediately on both ASGI < 2.4 and ASGI >= 2.4 scopes, and
+    closes its body and releases its slot only after any active worker step
+    exits.
     """
 
     def __init__(self, body: Iterator[bytes], slot: _Slot,
                  cancel_event: Optional[threading.Event] = None, **kw: Any):
-        super().__init__(body, **kw)
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        self._guarded_body = _GuardedBody(body, self._cancel_event)
+        super().__init__(self._guarded_body, **kw)
         self._body = body
         self._slot = slot
-        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
     async def __call__(self, scope, receive, send) -> None:
-        try:
-            if scope.get("type") == "websocket":
+        if scope.get("type") == "websocket":
+            try:
                 await super().__call__(scope, receive, send)
-                return
+            finally:
+                self._cancel_event.set()
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(self._close)
+            return
+
+        async def _run_stream() -> None:
             if _asgi_spec_version(scope) >= (2, 4):
                 exc: Optional[Exception] = None
                 async with anyio.create_task_group() as tg:
@@ -231,7 +270,7 @@ class _SpeechResponse(StreamingResponse):
 
                     tg.start_soon(_watch_disconnect)
                     try:
-                        await super().__call__(scope, receive, send)
+                        await super(_SpeechResponse, self).__call__(scope, receive, send)
                     except Exception as err:
                         self._cancel_event.set()
                         exc = err
@@ -247,17 +286,33 @@ class _SpeechResponse(StreamingResponse):
                         self._cancel_event.set()
                     return msg
 
-                await super().__call__(scope, _tracked_receive, send)
+                await super(_SpeechResponse, self).__call__(scope, _tracked_receive, send)
+
+        stream_task = asyncio.create_task(_run_stream())
+        try:
+            await asyncio.shield(stream_task)
+        except BaseException:
+            # Direct response-task cancellation (both ASGI 2.3 and 2.4+):
+            # signal the worker thread immediately before waiting for shutdown.
+            self._cancel_event.set()
+            stream_task.cancel()
+            with anyio.CancelScope(shield=True):
+                try:
+                    await stream_task
+                except BaseException:
+                    pass
+            raise
         finally:
             self._cancel_event.set()
-            # close() runs the generators' finally blocks, so keep it off the
-            # event loop. Shield cleanup so external cancellation still frees the slot.
+            # _guarded_body.close() acquires the step lock before closing the
+            # underlying generator, so slot release waits until any active
+            # worker step has exited.
             with anyio.CancelScope(shield=True):
                 await anyio.to_thread.run_sync(self._close)
 
     def _close(self) -> None:
         try:
-            self._body.close()
+            self._guarded_body.close()
         except Exception:   # noqa: BLE001 - the slot must be freed regardless
             log.exception("closing the speech body failed")
         finally:
