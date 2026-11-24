@@ -126,6 +126,8 @@ class Engine:
             self.max_streams = _env_int("VIENEU_MAX_STREAMS", cpu_default) if "VIENEU_MAX_STREAMS" in os.environ else cpu_default
         self.max_queue = _env_int("VIENEU_QUEUE", self.max_streams)
         self.queue_timeout = float(os.environ.get("VIENEU_QUEUE_TIMEOUT", "10"))
+        self.stream_chunk_frames = max(4, min(25, _env_int("VIENEU_STREAM_CHUNK_FRAMES", 25)))
+        self.stream_babble_retries = max(0, min(2, _env_int("VIENEU_STREAM_BABBLE_RETRIES", 0)))
         self._gate = threading.BoundedSemaphore(self.max_streams)
         self._lock = threading.Lock()
         self.active = 0
@@ -188,33 +190,75 @@ class _Slot:
             self._eng.release()
 
 
+def _asgi_spec_version(scope: dict) -> tuple[int, ...]:
+    asgi = scope.get("asgi")
+    raw = str(asgi.get("spec_version", "2.0")) if isinstance(asgi, dict) else "2.0"
+    try:
+        parts = tuple(int(p) for p in raw.split(".")[:2])
+        return parts if parts else (2, 0)
+    except ValueError:
+        return (2, 0)
+
+
 class _SpeechResponse(StreamingResponse):
-    """A ``StreamingResponse`` that closes its body the moment the response ends
-    — done, failed or client gone — instead of leaving that to the garbage
-    collector. Starlette drops a sync body without closing it when the client
-    disconnects, and the abandoned generators sit in a reference cycle, so
-    their ``finally`` (freeing the slot, cancelling the scheduler row) could
-    wait minutes on an idle server; with every slot stuck, all requests got 429.
+    """A ``StreamingResponse`` that signals disconnect cancellation immediately
+    on both ASGI < 2.4 and ASGI >= 2.4 scopes, and closes its body the moment
+    the response ends instead of leaving that to the garbage collector.
     """
 
-    def __init__(self, body: Iterator[bytes], slot: _Slot, **kw: Any):
+    def __init__(self, body: Iterator[bytes], slot: _Slot,
+                 cancel_event: Optional[threading.Event] = None, **kw: Any):
         super().__init__(body, **kw)
         self._body = body
         self._slot = slot
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
     async def __call__(self, scope, receive, send) -> None:
         try:
-            await super().__call__(scope, receive, send)
+            if scope.get("type") == "websocket":
+                await super().__call__(scope, receive, send)
+                return
+            if _asgi_spec_version(scope) >= (2, 4):
+                exc: Optional[Exception] = None
+                async with anyio.create_task_group() as tg:
+                    async def _watch_disconnect() -> None:
+                        while True:
+                            msg = await receive()
+                            if isinstance(msg, dict) and msg.get("type") == "http.disconnect":
+                                self._cancel_event.set()
+                                tg.cancel_scope.cancel()
+                                return
+
+                    tg.start_soon(_watch_disconnect)
+                    try:
+                        await super().__call__(scope, receive, send)
+                    except Exception as err:
+                        self._cancel_event.set()
+                        exc = err
+                        tg.cancel_scope.cancel()
+                    else:
+                        tg.cancel_scope.cancel()
+                if exc is not None:
+                    raise exc
+            else:
+                async def _tracked_receive():
+                    msg = await receive()
+                    if isinstance(msg, dict) and msg.get("type") == "http.disconnect":
+                        self._cancel_event.set()
+                    return msg
+
+                await super().__call__(scope, _tracked_receive, send)
         finally:
+            self._cancel_event.set()
             # close() runs the generators' finally blocks, so keep it off the
-            # event loop. By now no thread is inside the body: anyio waits for
-            # a cancelled to_thread call to return.
-            await anyio.to_thread.run_sync(self._close)
+            # event loop. Shield cleanup so external cancellation still frees the slot.
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(self._close)
 
     def _close(self) -> None:
         try:
             self._body.close()
-        except Exception:   # noqa: BLE001 — the slot must be freed regardless
+        except Exception:   # noqa: BLE001 - the slot must be freed regardless
             log.exception("closing the speech body failed")
         finally:
             self._slot.release()
@@ -323,19 +367,31 @@ class SpeechRequest(BaseModel):
     max_chars: int = Field(256, ge=64, le=512)
 
 
-def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot) -> Iterator[np.ndarray]:
+def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,
+                   cancel_event: Optional[threading.Event] = None) -> Iterator[np.ndarray]:
     """float32 chunks at ``req.sample_rate``; logs TTFA / RTF; holds one stream slot."""
     t0 = time.perf_counter()
     first = None
     emitted = 0
     rs = _Resampler(req.sample_rate)
+    extra: dict[str, Any] = {}
+    if cancel_event is not None:
+        extra["cancel_event"] = cancel_event
+    if eng.backend == "onnx":
+        extra["chunk_frames"] = eng.stream_chunk_frames
+        extra["stream_babble_retries"] = eng.stream_babble_retries
     audio = eng.tts.infer_stream(
         req.input, voice=req.voice or None, apply_watermark=eng.watermark,
         temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
         repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
+        **extra,
     )
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         for chunk in audio:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if chunk is None or len(chunk) == 0:
                 continue
             if first is None:
@@ -344,6 +400,8 @@ def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot) -> It
             out = rs(chunk)
             if len(out):
                 yield out
+        if cancel_event is not None and cancel_event.is_set():
+            return
         tail = rs(np.zeros(0, np.float32), last=True)
         if len(tail):
             yield tail
@@ -401,16 +459,19 @@ def speech(req: SpeechRequest):
     rid = f"spk-{uuid.uuid4().hex[:8]}"
     eng.acquire()   # 429 if the server is full; released when the stream ends
     slot = _Slot(eng)
-    chunks = _speech_chunks(eng, req, rid, slot)
+    cancel_event = threading.Event()
+    chunks = _speech_chunks(eng, req, rid, slot, cancel_event=cancel_event)
     headers = {"X-Request-Id": rid, "X-Sample-Rate": str(req.sample_rate), "Cache-Control": "no-store"}
     ignored = [k for k in ("speed", "instructions") if getattr(req, k) is not None]
     if ignored:
         headers["X-VieNeu-Ignored"] = ",".join(ignored)
     if req.stream_format == "sse":
         return _SpeechResponse(_sse_body(chunks, fmt, req.sample_rate), slot,
+                               cancel_event=cancel_event,
                                media_type="text/event-stream", headers=headers)
     media = "audio/wav" if fmt == "wav" else "audio/pcm"
-    return _SpeechResponse(_audio_body(chunks, fmt, req.sample_rate), slot, media_type=media, headers=headers)
+    return _SpeechResponse(_audio_body(chunks, fmt, req.sample_rate), slot,
+                           cancel_event=cancel_event, media_type=media, headers=headers)
 
 
 # ── discovery ────────────────────────────────────────────────────────────────

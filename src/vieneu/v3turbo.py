@@ -666,6 +666,9 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         repetition_window: int = DEFAULT_REP_WINDOW,
         max_chars: int = 256,
         apply_watermark: bool = True,
+        chunk_frames: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        stream_babble_retries: Optional[int] = None,
         **kwargs: Any,
     ) -> Generator[np.ndarray, None, None]:
         """Synthesize ``text`` and yield 48 kHz float32 audio as it is generated.
@@ -677,7 +680,11 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         streams on an RTX 3060. On CPU/ONNX the engine's own frame-level
         streaming runs, one call at a time.
         """
+        if cancel_event is not None and cancel_event.is_set():
+            return
         speaker_emb, ref_codes = self._resolve_ref(voice, ref_audio, denoise, use_ref_codes)
+        if cancel_event is not None and cancel_event.is_set():
+            return
         chunks, gaps = normalize_to_chunks_v3_with_gaps(text, max_chars=max_chars)
         pauses = gaps_to_silence(gaps)
         sampling = dict(
@@ -689,38 +696,70 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             per_chunk = self._stream_chunks_gpu(sched, chunks, speaker_emb, ref_codes,
                                                 use_ref_codes, max_new_frames, sampling)
         else:
-            per_chunk = self._stream_chunks_engine(chunks, speaker_emb, ref_codes,
-                                                   use_ref_codes, max_new_frames, sampling)
+            per_chunk = self._stream_chunks_engine(
+                chunks, speaker_emb, ref_codes, use_ref_codes, max_new_frames, sampling,
+                chunk_frames=chunk_frames,
+                cancel_event=cancel_event,
+                stream_babble_retries=stream_babble_retries,
+            )
         sr = self.sample_rate
         last_out: Optional[np.ndarray] = None   # mẩu audio cuối đã phát của chunk trước
-        for ci, subs in enumerate(per_chunk):
-            first = True
-            for sub in subs:
-                if sub is None or len(sub) == 0:
-                    continue
-                if first and last_out is not None:
-                    # Khoảng nghỉ giữa hai text chunk = TỔNG theo loại ranh giới, cùng
-                    # bảng với join_audio_chunks. Audio chunk trước đã phát đi nên không
-                    # trim được, chỉ bù zeros cho đủ (đuôi model tự phát dài hơn thì giữ).
-                    pad = pause_pad_samples(last_out, sub, sr, pauses[ci - 1])
-                    if pad > 0:
-                        yield np.zeros(pad, dtype=np.float32)
-                first = False
-                last_out = sub
-                yield self._apply_watermark(sub) if apply_watermark else sub
+        try:
+            for ci, subs in enumerate(per_chunk):
+                if cancel_event is not None and cancel_event.is_set():
+                    if hasattr(subs, "close"):
+                        subs.close()
+                    return
+                first = True
+                try:
+                    for sub in subs:
+                        if cancel_event is not None and cancel_event.is_set():
+                            return
+                        if sub is None or len(sub) == 0:
+                            continue
+                        if first and last_out is not None:
+                            # Khoảng nghỉ giữa hai text chunk = TỔNG theo loại ranh giới, cùng
+                            # bảng với join_audio_chunks. Audio chunk trước đã phát đi nên không
+                            # trim được, chỉ bù zeros cho đủ (đuôi model tự phát dài hơn thì giữ).
+                            pad = pause_pad_samples(last_out, sub, sr, pauses[ci - 1])
+                            if pad > 0:
+                                yield np.zeros(pad, dtype=np.float32)
+                                if cancel_event is not None and cancel_event.is_set():
+                                    return
+                        first = False
+                        last_out = sub
+                        yield self._apply_watermark(sub) if apply_watermark else sub
+                finally:
+                    if hasattr(subs, "close"):
+                        subs.close()
+        finally:
+            if hasattr(per_chunk, "close"):
+                per_chunk.close()
 
     def _stream_chunks_engine(self, chunks, speaker_emb, ref_codes, use_ref_codes,
-                              max_new_frames, sampling):
+                              max_new_frames, sampling, *,
+                              chunk_frames: Optional[int] = None,
+                              cancel_event: Optional[threading.Event] = None,
+                              stream_babble_retries: Optional[int] = None):
         """One audio iterator per text chunk from the engine's own streaming
         (PyTorch single path or ONNX); a full ``infer`` per chunk if it has none."""
         stream_fn = getattr(self.engine, "infer_stream", None)
         for chunk in chunks:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             ph = phonemize_text_with_emotions(chunk)
             gen_kwargs = dict(
                 phonemes=ph, speaker_emb=speaker_emb, ref_codes=ref_codes,
                 use_ref_codes=use_ref_codes,
                 max_new_frames=min(max_new_frames, max_expected_frames(ph)), **sampling,
             )
+            if self.backend == "onnx":
+                if chunk_frames is not None:
+                    gen_kwargs["chunk_frames"] = chunk_frames
+                if cancel_event is not None:
+                    gen_kwargs["cancel_event"] = cancel_event
+                if stream_babble_retries is not None:
+                    gen_kwargs["stream_babble_retries"] = stream_babble_retries
             yield stream_fn(**gen_kwargs) if stream_fn is not None else (self.engine.infer(**gen_kwargs),)
 
     def _stream_chunks_gpu(self, sched, chunks, speaker_emb, ref_codes, use_ref_codes,

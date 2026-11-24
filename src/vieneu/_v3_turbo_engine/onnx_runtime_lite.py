@@ -34,7 +34,11 @@ from typing import Generator, List, Optional, Tuple, Union
 import numpy as np
 
 from .rep_history import DEFAULT_REP_WINDOW, RepetitionHistory
-from vieneu_utils.core_utils import (BABBLE_MAX_RETRIES, babble_suspect, babble_prefer, babble_log_line, CODEC_SAMPLES_PER_FRAME, pad_to_codec_frame)
+from vieneu_utils.core_utils import (
+    BABBLE_MAX_RETRIES, BABBLE_MAX_SYLLABLES, babble_suspect, babble_prefer,
+    babble_log_line, CODEC_SAMPLES_PER_FRAME, is_cue_only, pad_to_codec_frame,
+    syllable_count,
+)
 import logging
 
 _V3_REPO = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
@@ -176,9 +180,27 @@ class OnnxV3LiteEngine:
             self.sess_codec_step = None  # streaming decode unavailable → infer_stream falls back
 
         # ── Speaker encoder + denoiser (voice cloning), from repo root ──────────
-        # Both torch-free; the speaker encoder is loaded lazily on first clone.
+        # Both torch-free and loaded lazily on first use so preset-only servers
+        # skip loading cloning sessions at startup.
         self.speaker_encoder = None
-        self.denoiser = self._load_denoiser()
+        self._denoiser = None
+        self._denoiser_loaded = False
+        self._denoiser_lock = threading.Lock()
+
+    @property
+    def denoiser(self):
+        if not self._denoiser_loaded:
+            with self._denoiser_lock:
+                if not self._denoiser_loaded:
+                    self._denoiser = self._load_denoiser()
+                    self._denoiser_loaded = True
+        return self._denoiser
+
+    @denoiser.setter
+    def denoiser(self, value) -> None:
+        with self._denoiser_lock:
+            self._denoiser = value
+            self._denoiser_loaded = True
 
     # ── artifact helpers ──────────────────────────────────────────────────────
     @staticmethod
@@ -324,7 +346,10 @@ class OnnxV3LiteEngine:
             feed[f"past_v_{i}"] = pv[i]
         return feed
 
-    def _acoustic_frame(self, h, temperature, top_k, top_p, rep_pen, hist):
+    def _acoustic_frame(self, h, temperature, top_k, top_p, rep_pen, hist,
+                        cancel_event: Optional[threading.Event] = None):
+        if cancel_event is not None and cancel_event.is_set():
+            return None, False
         H = self.hidden
         cond = h[0].astype(np.float32)
         txt = self.text_emb[self.sgs].astype(np.float32)
@@ -332,6 +357,8 @@ class OnnxV3LiteEngine:
         feed = {"token_emb": tok, "position_ids": np.array([[0, 1]], np.int64)}
         feed.update(self._empty_past())
         out = self.sess_ac.run(None, feed)
+        if cancel_event is not None and cancel_event.is_set():
+            return None, False
         hidden = out[0]
         pk, pv = self._split_past(out, self.L_loc)
         slot0 = hidden[0, 0]
@@ -346,11 +373,15 @@ class OnnxV3LiteEngine:
 
         codes = [samp(0, hidden[0, 1])]
         for ch in range(1, self.n_vq):
+            if cancel_event is not None and cancel_event.is_set():
+                return None, False
             emb = self.audio_emb[ch - 1][codes[-1]].astype(np.float32)
             feed = {"token_emb": emb.reshape(1, 1, H),
                     "position_ids": np.array([[ch + 1]], np.int64)}
             feed.update(self._past_feed(pk, pv))
             out = self.sess_ac.run(None, feed)
+            if cancel_event is not None and cancel_event.is_set():
+                return None, False
             hidden = out[0]
             pk, pv = self._split_past(out, self.L_loc)
             codes.append(samp(ch, hidden[0, 0]))
@@ -370,9 +401,11 @@ class OnnxV3LiteEngine:
         wav, sr = self._load_mono(ref_audio, sr)                    # (n,) float32
         if wav.shape[-1] > int(max_seconds * sr):
             wav = wav[: int(max_seconds * sr)]
-        if denoise and self.denoiser is not None:
-            wav = self.denoiser.denoise(wav, sr)                    # -> float32 @ 44100
-            sr = 44100
+        if denoise:
+            den = self.denoiser
+            if den is not None:
+                wav = den.denoise(wav, sr)                          # -> float32 @ 44100
+                sr = 44100
         speaker_emb = self._ensure_speaker_encoder().embed(wav, sr) if self.use_speaker_embedding else None
         ref_codes = self._encode_ref_wav(wav, sr) if use_ref_codes else None
         return speaker_emb, ref_codes
@@ -484,6 +517,128 @@ class OnnxV3LiteEngine:
             state[a["cached_positions_input_name"]] = d[a["cached_positions_output_name"]]
         return d["audio"][0].mean(0)[: int(d["audio_lengths"][0])].astype(np.float32)
 
+    @staticmethod
+    def _is_short_cue_for_babble(phonemes: str) -> bool:
+        if is_cue_only(phonemes):
+            return True
+        if "<|emotion_" in (phonemes or ""):
+            return False
+        syl = syllable_count(phonemes)
+        return 0 < syl <= BABBLE_MAX_SYLLABLES
+
+    def _generate_cancellable(
+        self,
+        *,
+        phonemes: str,
+        prompt_embeds: np.ndarray,
+        anchor: Optional[np.ndarray],
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        max_new_frames: int,
+        repetition_penalty: float,
+        repetition_window: int,
+        retries: int,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Optional[np.ndarray]:
+        """Bounded, cancellable whole-chunk generation with babble retries for short cues."""
+        def _cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        def _gen_once() -> Optional[List[np.ndarray]]:
+            if _cancelled():
+                return None
+            with self._lock:
+                if _cancelled():
+                    return None
+                pre = self.sess_pre.run(None, {"inputs_embeds": prompt_embeds})
+                if _cancelled():
+                    return None
+                past_k = [pre[1 + i] for i in range(self.L)]
+                past_v = [pre[1 + self.L + i] for i in range(self.L)]
+                h = pre[0][:, -1]
+                Tprompt = prompt_embeds.shape[1]
+                hist = RepetitionHistory(self.n_vq, repetition_window) if not math.isclose(repetition_penalty, 1.0) else None
+            frames: List[np.ndarray] = []
+            for t in range(max_new_frames):
+                if _cancelled():
+                    return None
+                with self._lock:
+                    if _cancelled():
+                        return None
+                    codes, eos = self._acoustic_frame(
+                        h, temperature, top_k, top_p, repetition_penalty, hist,
+                        cancel_event=cancel_event,
+                    )
+                    if codes is None or _cancelled():
+                        return None
+                    frames.append(np.asarray(codes, dtype=np.int64))
+                    if eos:
+                        break
+                    slot = np.full((1, 1, self.n_vq + 1), self.audio_pad, dtype=np.int64)
+                    slot[:, :, 0] = self.sgs
+                    slot[0, 0, 1:] = codes
+                    se = self._embed_rows(slot[0], anchor)
+                    feed = {"inputs_embeds": se, "position_ids": np.array([[Tprompt + t]], np.int64)}
+                    for i in range(self.L):
+                        feed[f"past_k_{i}"] = past_k[i]
+                        feed[f"past_v_{i}"] = past_v[i]
+                    if _cancelled():
+                        return None
+                    out = self.sess_dec.run(None, feed)
+                    if _cancelled():
+                        return None
+                    h = out[0][:, 0]
+                    past_k = [out[1 + i] for i in range(self.L)]
+                    past_v = [out[1 + self.L + i] for i in range(self.L)]
+            return frames
+
+        def _decode_cancellable(frames: List[np.ndarray]) -> Optional[np.ndarray]:
+            if _cancelled():
+                return None
+            with self._lock:
+                if _cancelled():
+                    return None
+                wav = self._decode_codes(np.stack(frames))
+            if _cancelled():
+                return None
+            return wav
+
+        frames = _gen_once()
+        if frames is None:
+            return None
+        if not frames:
+            return np.zeros(0, dtype=np.float32)
+        wav = _decode_cancellable(frames)
+        if wav is None:
+            return None
+
+        sr = int(getattr(self, "sample_rate", self.SAMPLE_RATE))
+        best = babble_suspect(wav, sr, phonemes, max_new_frames, len(frames))
+        tries = 0
+        while best[0] and tries < retries:
+            if _cancelled():
+                return None
+            f2 = _gen_once()
+            if f2 is None:
+                return None
+            tries += 1
+            if not f2:
+                continue
+            w2 = _decode_cancellable(f2)
+            if w2 is None:
+                return None
+            cand = babble_suspect(w2, sr, phonemes, max_new_frames, len(f2))
+            if babble_prefer(cand, best):
+                frames, wav, best = f2, w2, cand
+        if tries and not _cancelled():
+            logging.getLogger("Vieneu.V3Turbo.ONNX").info(
+                "🔁 " + babble_log_line(best, tries, max_new_frames)
+            )
+        if _cancelled():
+            return None
+        return wav
+
     def infer_stream(self, phonemes: Optional[str] = None, text: str = "", ref_codes=None,
                      speaker_emb=None, style=None,   # style: DEPRECATED, ignored
                      use_ref_codes: bool = True,
@@ -491,23 +646,34 @@ class OnnxV3LiteEngine:
                      max_new_frames: int = 300, chunk_frames: int = 25,
                      repetition_penalty: float = 1.2,
                      repetition_window: int = DEFAULT_REP_WINDOW,
-                     frame_cap: bool = True, **_kw) -> Generator[np.ndarray, None, None]:
+                     frame_cap: bool = True,
+                     cancel_event: Optional[threading.Event] = None,
+                     stream_babble_retries: int = 0, **_kw) -> Generator[np.ndarray, None, None]:
         """Native low-latency streaming: yields 48 kHz audio as frames are produced.
 
         Uses the MOSS streaming codec (decode_step), which is bit-exact to the full
         decoder, so streamed audio matches non-streaming quality with no boundary
         clicks. Falls back to a single ``infer`` if the streaming codec is missing.
         """
+        def _cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        if _cancelled():
+            return
         if self.sess_codec_step is None or self._codec_stream_spec is None:
-            yield self.infer(phonemes=phonemes, text=text, ref_codes=ref_codes,
+            wav = self.infer(phonemes=phonemes, text=text, ref_codes=ref_codes,
                              speaker_emb=speaker_emb, use_ref_codes=use_ref_codes,
                              temperature=temperature, top_k=top_k, top_p=top_p,
                              max_new_frames=max_new_frames, repetition_penalty=repetition_penalty,
                              repetition_window=repetition_window)
+            if not _cancelled():
+                yield wav
             return
         if phonemes is None:
             from vieneu_utils.phonemize_text import phonemize_text_with_emotions
             phonemes = phonemize_text_with_emotions(text)
+        if _cancelled():
+            return
         if frame_cap:
             from vieneu_utils.core_utils import max_expected_frames
             max_new_frames = min(max_new_frames, max_expected_frames(phonemes))
@@ -518,9 +684,34 @@ class OnnxV3LiteEngine:
         rows = self._build_rows(phonemes, ref_codes, style_id)
         prompt_embeds = self._embed_rows(rows, anchor)
 
+        babble_retries = max(0, min(2, int(stream_babble_retries or 0)))
+        if babble_retries > 0 and frame_cap and self._is_short_cue_for_babble(phonemes):
+            wav = self._generate_cancellable(
+                phonemes=phonemes,
+                prompt_embeds=prompt_embeds,
+                anchor=anchor,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                max_new_frames=max_new_frames,
+                repetition_penalty=repetition_penalty,
+                repetition_window=repetition_window,
+                retries=babble_retries,
+                cancel_event=cancel_event,
+            )
+            if wav is not None and wav.size and not _cancelled():
+                yield wav
+            return
+
+        if _cancelled():
+            return
         # Acquire initial prefill under lock, then do per-iteration ONNX calls
         with self._lock:
+            if _cancelled():
+                return
             pre = self.sess_pre.run(None, {"inputs_embeds": prompt_embeds})
+            if _cancelled():
+                return
             past_k = [pre[1 + i] for i in range(self.L)]
             past_v = [pre[1 + self.L + i] for i in range(self.L)]
             h = pre[0][:, -1]
@@ -547,10 +738,19 @@ class OnnxV3LiteEngine:
             return cap
 
         for t in range(max_new_frames):
+            if _cancelled():
+                return
             wav_chunk = None
             # protect ONNX session calls per-iteration; release before yielding
             with self._lock:
-                codes, eos = self._acoustic_frame(h, temperature, top_k, top_p, repetition_penalty, hist)
+                if _cancelled():
+                    return
+                codes, eos = self._acoustic_frame(
+                    h, temperature, top_k, top_p, repetition_penalty, hist,
+                    cancel_event=cancel_event,
+                )
+                if codes is None or _cancelled():
+                    return
                 buffer.append(np.asarray(codes, dtype=np.int64))
                 if not eos:
                     slot = np.full((1, 1, self.n_vq + 1), self.audio_pad, dtype=np.int64)
@@ -561,16 +761,26 @@ class OnnxV3LiteEngine:
                     for i in range(self.L):
                         feed[f"past_k_{i}"] = past_k[i]
                         feed[f"past_v_{i}"] = past_v[i]
+                    if _cancelled():
+                        return
                     out = self.sess_dec.run(None, feed)
+                    if _cancelled():
+                        return
                     h = out[0][:, 0]
                     past_k = [out[1 + i] for i in range(self.L)]
                     past_v = [out[1 + self.L + i] for i in range(self.L)]
                 if len(buffer) >= _target() or eos:
+                    if _cancelled():
+                        return
                     wav_chunk = self._stream_decode(np.stack(buffer), state)
                     buffer = []
+                    if _cancelled():
+                        return
 
             # yield after the lock is released
             if wav_chunk is not None and wav_chunk.size:
+                if _cancelled():
+                    return
                 if t_first is None:
                     t_first = time.perf_counter()
                 emitted += wav_chunk.size
@@ -578,10 +788,14 @@ class OnnxV3LiteEngine:
             if eos:
                 break
 
-        if buffer:
+        if buffer and not _cancelled():
             with self._lock:
+                if _cancelled():
+                    return
                 wav = self._stream_decode(np.stack(buffer), state)
-            if wav.size:
+                if _cancelled():
+                    return
+            if wav.size and not _cancelled():
                 yield wav
 
     # ── codec (MOSS ONNX) ──────────────────────────────────────────────────────

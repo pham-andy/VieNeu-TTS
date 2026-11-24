@@ -45,7 +45,8 @@ class FakeTTS:
 
 @pytest.fixture
 def eng(monkeypatch):
-    for var in ("VIENEU_API_KEY", "VIENEU_MAX_STREAMS", "VIENEU_QUEUE"):
+    for var in ("VIENEU_API_KEY", "VIENEU_MAX_STREAMS", "VIENEU_QUEUE",
+                "VIENEU_STREAM_CHUNK_FRAMES", "VIENEU_STREAM_BABBLE_RETRIES"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(api, "Vieneu", lambda **kw: FakeTTS())
     e = api.Engine()
@@ -186,3 +187,161 @@ def test_open_public_bind_is_logged(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="vieneu.api"):
         api.main()
     assert "without VIENEU_API_KEY" in caplog.text
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+def test_disconnect_sets_cancel_event_and_releases_slot_across_asgi_versions(eng, spec_version):
+    import threading
+    import time
+
+    started = threading.Event()
+    saw_cancel = threading.Event()
+    receive_calls = 0
+
+    def blocking_stream(text, **kw):
+        cancel_event = kw.get("cancel_event")
+        assert cancel_event is not None
+        started.set()
+        try:
+            # Block until disconnect sets cancel_event (simulates long ONNX prefill/frame).
+            if cancel_event.wait(timeout=5.0):
+                saw_cancel.set()
+                return
+            yield np.zeros(4800, dtype=np.float32)
+        finally:
+            eng.tts.streams_closed += 1
+
+    eng.tts.infer_stream = blocking_stream
+    resp = api.speech(api.SpeechRequest(input="Xin chào.", response_format="pcm"))
+    assert eng.active == 1
+
+    async def run():
+        nonlocal receive_calls
+        disconnect_ready = asyncio.Event()
+
+        async def receive():
+            nonlocal receive_calls
+            receive_calls += 1
+            await disconnect_ready.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_msg):
+            pass
+
+        async def trigger_disconnect():
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            disconnect_ready.set()
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": spec_version}, "method": "POST"}
+        t0 = time.perf_counter()
+        await asyncio.gather(resp(scope, receive, send), trigger_disconnect())
+        return time.perf_counter() - t0
+
+    elapsed = asyncio.run(run())
+    assert saw_cancel.is_set(), f"ASGI {spec_version}: cancel_event was not set promptly on disconnect"
+    assert elapsed < 2.0, f"ASGI {spec_version}: disconnect took too long ({elapsed:.2f}s)"
+    assert eng.active == 0
+    assert eng._gate.acquire(blocking=False)
+    eng._gate.release()
+    assert eng.tts.streams_closed == 2   # warm-up + cancelled stream
+    assert receive_calls == 1, f"ASGI {spec_version}: expected single receive() consumer, got {receive_calls}"
+
+
+def test_asgi_24_normal_completion_cancels_disconnect_watcher(eng):
+    resp = api.speech(api.SpeechRequest(input="Xin chào.", response_format="pcm"))
+    assert eng.active == 1
+
+    async def run():
+        never = asyncio.Event()
+        bodies = []
+
+        async def receive():
+            await never.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            if msg["type"] == "http.response.body":
+                bodies.append(msg.get("body", b""))
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "method": "POST"}
+        await asyncio.wait_for(resp(scope, receive, send), timeout=3.0)
+        return b"".join(bodies)
+
+    payload = asyncio.run(run())
+    assert len(payload) == 4800 * 2
+    assert eng.active == 0
+    assert eng.tts.streams_closed == 2
+
+
+def test_asgi_24_send_oserror_propagates_client_disconnect_and_releases_slot(eng):
+    from starlette.requests import ClientDisconnect
+
+    eng.tts.stream_len = 5
+    resp = api.speech(api.SpeechRequest(input="Xin chào.", response_format="pcm"))
+    assert eng.active == 1
+
+    async def run():
+        never = asyncio.Event()
+
+        async def receive():
+            await never.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            if msg["type"] == "http.response.body":
+                raise OSError("broken pipe")
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "method": "POST"}
+        with pytest.raises(ClientDisconnect):
+            await resp(scope, receive, send)
+
+    asyncio.run(run())
+    assert eng.active == 0
+    assert eng._gate.acquire(blocking=False)
+    eng._gate.release()
+
+
+def test_onnx_stream_env_vars_clamped_and_only_forwarded_on_onnx(monkeypatch):
+    monkeypatch.setenv("VIENEU_STREAM_CHUNK_FRAMES", "8")
+    monkeypatch.setenv("VIENEU_STREAM_BABBLE_RETRIES", "1")
+    monkeypatch.setattr(api, "Vieneu", lambda **kw: FakeTTS())
+    e_onnx = api.Engine()
+    monkeypatch.setattr(api, "ENGINE", e_onnx)
+    with TestClient(api.app) as c:
+        r = c.post("/v1/audio/speech", json={"input": "Xin chào.", "response_format": "pcm"})
+        assert r.status_code == 200
+    call = e_onnx.tts.stream_calls[-1]
+    assert call["chunk_frames"] == 8
+    assert call["stream_babble_retries"] == 1
+    assert "cancel_event" in call
+
+    # Out-of-bounds env values clamp safely to 4..25 and 0..2.
+    monkeypatch.setenv("VIENEU_STREAM_CHUNK_FRAMES", "999")
+    monkeypatch.setenv("VIENEU_STREAM_BABBLE_RETRIES", "99")
+    e_hi = api.Engine()
+    assert e_hi.stream_chunk_frames == 25
+    assert e_hi.stream_babble_retries == 2
+    monkeypatch.setenv("VIENEU_STREAM_CHUNK_FRAMES", "1")
+    monkeypatch.setenv("VIENEU_STREAM_BABBLE_RETRIES", "-5")
+    e_lo = api.Engine()
+    assert e_lo.stream_chunk_frames == 4
+    assert e_lo.stream_babble_retries == 0
+
+    # PyTorch backend must NOT receive ONNX-only chunk_frames or stream_babble_retries.
+    class FakePyTorchTTS(FakeTTS):
+        backend = "pytorch"
+        def _get_stream_scheduler(self):
+            return None
+
+    monkeypatch.setenv("VIENEU_STREAM_CHUNK_FRAMES", "8")
+    monkeypatch.setenv("VIENEU_STREAM_BABBLE_RETRIES", "1")
+    monkeypatch.setattr(api, "Vieneu", lambda **kw: FakePyTorchTTS())
+    e_pt = api.Engine()
+    monkeypatch.setattr(api, "ENGINE", e_pt)
+    with TestClient(api.app) as c:
+        r = c.post("/v1/audio/speech", json={"input": "Xin chào.", "response_format": "pcm"})
+        assert r.status_code == 200
+    pt_call = e_pt.tts.stream_calls[-1]
+    assert "chunk_frames" not in pt_call
+    assert "stream_babble_retries" not in pt_call
